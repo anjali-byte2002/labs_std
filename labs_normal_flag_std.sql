@@ -70,11 +70,17 @@
 --     'NON-REACTIVE', etc.)
 -- ============================================================================
 
+-- ============================================================================
+-- Labs normal_flag standardization -- rgd_gold_ad.labs -- v2
+-- Adds: ratio/titer parsing, qualitative Positive/Negative match-vs-range
+-- comparison (replacing straight passthrough), microscopy quantity-word
+-- HIGH override, and a range-canonicalization bug fix ("< = N" spacing).
+-- Read-only SELECT -- no ALTER TABLE / write access required.
+-- ============================================================================
+
 WITH value_norm AS (
     SELECT
         l.*,
-        -- Some result_value rows are wrapped in an XML envelope
-        -- ("<?xml ...?> <root>=1</root>") -- unwrap before classifying.
         CASE
             WHEN result_value REGEXP '<root>.*</root>'
                 THEN REGEXP_REPLACE(result_value, '^.*<root>(.*)</root>.*$', '$1')
@@ -86,46 +92,67 @@ WITH value_norm AS (
 range_norm AS (
     SELECT
         *,
-        -- Canonicalize result_range formats before classifying:
-        --   (X-Y)        -> X-Y            (strip wrapping parens)
-        --   > OR = N     -> >= N           (textual "OR =" variant)
-        --   < OR = N     -> <= N
-        --   X TO Y       -> X-Y            (TO as a range separator word)
-        --   -N +M        -> -N-+M          (space-separated signed pair)
         REGEXP_REPLACE(
             REGEXP_REPLACE(
                 REGEXP_REPLACE(
                     REGEXP_REPLACE(
-                        UPPER(TRIM(REGEXP_REPLACE(result_range, '^\\((.*)\\)$', '$1'))),
-                        '>\\s*OR\\s*=', '>='),
-                    '<\\s*OR\\s*=', '<='),
-                '\\bTO\\b', '-'),
-            '^(-[0-9]+\\.?[0-9]*)\\s+(\\+[0-9]+\\.?[0-9]*)$', '$1-$2'
-        ) AS rr_canon
+                        REGEXP_REPLACE(
+                            UPPER(TRIM(REGEXP_REPLACE(result_range, '^\\((.*)\\)$', '$1'))),
+                            '>\\s*OR\\s*=', '>='),
+                        '<\\s*OR\\s*=', '<='),
+                    '\\bTO\\b', '-'),
+                '^(-[0-9]+\\.?[0-9]*)\\s+(\\+[0-9]+\\.?[0-9]*)$', '$1-$2'
+            ),
+            '([<>])\\s*=', '$1='          -- NEW: "< = 11" -> "<=11" (space between operator and '=')
+        ) AS rr_canon0
     FROM value_norm
+),
+
+range_ratio_norm AS (
+    SELECT
+        *,
+        CASE
+            WHEN rr_canon0 REGEXP '[0-9]+\\s*:\\s*[0-9]+' THEN
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        REGEXP_REPLACE(rr_canon0, '^(NEG\\w*|NON\\s*-?\\s*REA\\w*)\\s*:?\\s*\\(?\\s*', ''),
+                        '\\)\\s*$', ''
+                    ),
+                    '[0-9]+\\s*:\\s*([0-9]+)', '$1'
+                )
+            ELSE rr_canon0
+        END AS rr_canon
+    FROM range_norm
 ),
 
 shape_classified AS (
     SELECT
         *,
         TRIM(rv_unwrapped) AS rv,
-        -- ================= RANGE SHAPE =================
-        -- Priority matters: check most-specific shapes first.
+        -- NEW: value-side ratio/titer + Negative-prefix normalization,
+        -- folded into a form the existing numeric/qualitative machinery
+        -- already understands (bare denominator, or literal 'NEGATIVE').
+        CASE
+            WHEN UPPER(TRIM(rv_unwrapped)) REGEXP '^(NEG\\w*|NON\\s*-?\\s*REA\\w*)' THEN 'NEGATIVE'
+            WHEN TRIM(rv_unwrapped) REGEXP '[0-9]+\\s*:\\s*[0-9]+'
+                THEN REGEXP_REPLACE(TRIM(rv_unwrapped), '^.*?[0-9]+\\s*:\\s*([0-9]+).*$', '$1')
+            ELSE TRIM(rv_unwrapped)
+        END AS rv2,
         CASE
             WHEN rr_canon IS NULL OR TRIM(rr_canon) = '' THEN 'blank'
             WHEN rr_canon REGEXP '^[<>]=?\\s*-?[0-9]+\\.?[0-9]*\\s*-\\s*[<>]=?\\s*-?[0-9]+\\.?[0-9]*'
-                THEN 'combined'          -- e.g. '>2-<10'
+                THEN 'combined'
             WHEN rr_canon REGEXP '^[<>]=?\\s*-?[0-9]+\\.?[0-9]*'
-                THEN 'single_bound'      -- e.g. '>=60', '<=1.0', '>59'
+                THEN 'single_bound'
             WHEN rr_canon REGEXP '^-?[0-9]+\\.?[0-9]*\\s*-\\s*[+-]?[0-9]+\\.?[0-9]*'
-                THEN 'plain_range'       -- e.g. '32.0-36.0', '-9.9-3.3'
+                THEN 'plain_range'
             WHEN rr_canon REGEXP '^[0-9]+\\.?[0-9]*'
-                THEN 'point'             -- e.g. '0' (bare reference value)
+                THEN 'point'
             WHEN rr_canon NOT REGEXP '[0-9]'
-                THEN 'qualitative'       -- e.g. 'NEGATIVE', 'Clear'
+                THEN 'qualitative'
             ELSE 'unparseable'
         END AS range_shape
-    FROM range_norm
+    FROM range_ratio_norm
 ),
 
 bounds_extracted AS (
@@ -191,16 +218,50 @@ bounds_extracted AS (
 value_classified AS (
     SELECT
         *,
+        -- NEW: microscopy quantity-word HIGH override, checked ahead of
+        -- everything else -- 'occ/hpf', 'few/lpf', 'many/hpf', 'FEW
+        -- (10-25/HPF)', etc. A leading test-name|-prefix (e.g. "URBC|") is
+        -- stripped first. Explicitly does NOT match 'none/hpf' or a bare
+        -- numeric count-range like '0-5/hpf' (anchored to the presence
+        -- word at the start, so 'NONE-OCC/LPF' is correctly excluded too).
+        REGEXP_REPLACE(UPPER(TRIM(rv)), '^[A-Z0-9 _]+\\|', '')
+            REGEXP '^(OCC|FEW|MANY|MODERATE|MOD|NUMEROUS|RARE|PACKED)([[:space:]]|\\(|/)' AS is_microscopy_high,
         CASE
-            WHEN rv IS NULL OR rv = '' THEN 'blank'
-            WHEN UPPER(rv) REGEXP '^#\\s*[0-9]+$' THEN 'noise'
-            WHEN UPPER(rv) REGEXP '^\\*?\\(?\\[?\\s*(PLEASE\\s+)?(SEE\\s+)?(FOOT)?NOTES?\\s*:?\\s*\\)?\\]?$' THEN 'noise'
-            WHEN rv REGEXP '\\(\\(INSURANCEDETAILS\\)\\)' THEN 'noise'
-            WHEN rv REGEXP '^[=<>]{0,2}\\s*-?[0-9]+\\.?[0-9]*\\s*$' THEN 'numeric'
-            WHEN rv NOT REGEXP '[0-9]' THEN 'qualitative'
+            WHEN rv2 IS NULL OR rv2 = '' THEN 'blank'
+            WHEN UPPER(rv2) REGEXP '^#\\s*[0-9]+$' THEN 'noise'
+            WHEN UPPER(rv2) REGEXP '^\\*?\\(?\\[?\\s*(PLEASE\\s+)?(SEE\\s+)?(FOOT)?NOTES?\\s*:?\\s*\\)?\\]?$' THEN 'noise'
+            WHEN rv2 REGEXP '\\(\\(INSURANCEDETAILS\\)\\)' THEN 'noise'
+            WHEN rv2 REGEXP '^[=<>]{0,2}\\s*-?[0-9]+\\.?[0-9]*\\s*$' THEN 'numeric'
+            -- NEW: a grade symbol followed by descriptive text (e.g. "1+
+            -- (small)", "2+ trace") is still a semi-quantitative
+            -- qualitative result, not "unparseable" just because it has
+            -- a digit in it -- route it to the qualitative comparison.
+            WHEN TRIM(rv2) REGEXP '^[1-4]?\\+' THEN 'qualitative'
+            WHEN rv2 NOT REGEXP '[0-9]' THEN 'qualitative'
             ELSE 'unparseable'
         END AS value_shape,
-        CAST(REGEXP_SUBSTR(rv, '-?[0-9]+\\.?[0-9]*') AS DOUBLE) AS rv_numeric
+        CAST(REGEXP_SUBSTR(rv2, '-?[0-9]+\\.?[0-9]*') AS DOUBLE) AS rv_numeric,
+        -- NEW: qualitative Positive/Negative synonym + grade-symbol
+        -- canonicalization, applied to BOTH value and range, for the
+        -- match-vs-range comparison rule below.
+        CASE
+            WHEN UPPER(TRIM(rv2)) REGEXP '^(POSITIVE|POS|REACTIVE|DETECTED|PRESENT)$'
+                 OR TRIM(rv2) REGEXP '^[1-4]?\\+'
+                THEN 'POSITIVE'
+            WHEN UPPER(TRIM(rv2)) REGEXP '^(NEGATIVE|NEG|NON[- ]?REACTIVE|NONREACTIVE|NOT DETECTED|ABSENT)$'
+                 OR TRIM(rv2) = '-'
+                THEN 'NEGATIVE'
+            ELSE UPPER(TRIM(rv2))
+        END AS value_qual_canon,
+        CASE
+            WHEN UPPER(TRIM(rr_canon)) REGEXP '^(POSITIVE|POS|REACTIVE|DETECTED|PRESENT)$'
+                 OR TRIM(rr_canon) REGEXP '^[1-4]?\\+$'
+                THEN 'POSITIVE'
+            WHEN UPPER(TRIM(rr_canon)) REGEXP '^(NEGATIVE|NEG|NON[- ]?REACTIVE|NONREACTIVE|NOT DETECTED|ABSENT)$'
+                 OR TRIM(rr_canon) = '-'
+                THEN 'NEGATIVE'
+            ELSE UPPER(TRIM(rr_canon))
+        END AS range_qual_canon
     FROM bounds_extracted
 )
 
@@ -209,6 +270,10 @@ SELECT
     result_value, result_range, normal_flag,
     range_shape, value_shape,
     CASE
+        -- 0. Microscopy quantity-word override wins outright (occ/hpf,
+        --    few/lpf, many/hpf, moderate, etc. -- a found nonzero count).
+        WHEN is_microscopy_high = 1 THEN 'HIGH'
+
         -- 1. Noise in result_value always wins, regardless of range.
         WHEN value_shape = 'noise' THEN 'INVALID_RESULT_VALUE'
         WHEN value_shape = 'blank' THEN 'INVALID_RESULT_VALUE'
@@ -216,7 +281,8 @@ SELECT
         -- 2. Range must be usable before anything else is evaluated.
         WHEN range_shape IN ('blank', 'unparseable') THEN 'INVALID_RESULT_RANGE'
 
-        -- 3. Numeric result_value -> compare against the parsed range.
+        -- 3. Numeric result_value (incl. ratio/titer denominators folded
+        --    into rv2 above) -> compare against the parsed numeric range.
         WHEN value_shape = 'numeric' AND range_shape = 'qualitative' THEN 'INVALID_RESULT_RANGE'
         WHEN value_shape = 'numeric' THEN
             CASE
@@ -231,14 +297,46 @@ SELECT
                 ELSE 'NORMAL'
             END
 
-        -- 4. Qualitative (text) result_value -> pass result_range through
-        --    as-is for secondary-stage standardization.
-        WHEN value_shape = 'qualitative' AND range_shape = 'qualitative' THEN result_range
+        -- 4. Qualitative (text) result_value -> compare the canonicalized
+        --    value against the canonicalized range: match -> NORMAL,
+        --    mismatch -> ABNORMAL (replaces the old straight-passthrough
+        --    rule, which just copied result_range verbatim regardless of
+        --    whether it actually matched result_value).
+        -- Some result_range values are a comma-separated LIST of multiple
+        -- acceptable qualitative states, not a single value -- e.g.
+        -- "Colorless, Straw, Yellow" or "Clear, Slt Hazy, Hazy, Slt
+        -- Cloudy" or "Negative, Trace". Confirmed via live data: strict
+        -- equality falsely flags a legitimate listed value (e.g. value
+        -- "Yellow" vs range "Colorless, Straw, Yellow") as ABNORMAL when
+        -- the raw normal_flag says Normal.
+        -- NOTE: a plain substring check ("range LIKE %value%") is NOT
+        -- safe here -- confirmed live regression where value "CLOUDY"
+        -- false-matched inside range token "SLT CLOUDY" (a different,
+        -- lesser severity grade), flipping a true Abnormal to Normal.
+        -- FIND_IN_SET on a whitespace-normalized comma list gives exact
+        -- token membership instead, which resolves both the list-range
+        -- case AND avoids the substring false-positive.
+        -- A hyphen is ALSO treated as a list separator here (not just a
+        -- numeric-range dash) -- confirmed live: "Yellow-Amber" is a
+        -- color-spectrum reference range where both endpoints ("Yellow",
+        -- "Amber") individually carry normal_flag='N', the dominant
+        -- pattern by volume (2,301 + 180 rows). True Positive/Negative
+        -- hyphenated synonyms ("NON-REACTIVE") are already intercepted by
+        -- the canonical POSITIVE/NEGATIVE mapping above and never reach
+        -- this branch as a raw hyphenated string, so splitting on '-'
+        -- here is safe. Known residual limitation: a value between the
+        -- two endpoints but not equal to either (e.g. "Colorless" vs
+        -- "Yellow-Amber", 313 rows) still reads ABNORMAL here despite
+        -- normal_flag='N' -- resolving that would require an actual
+        -- clinical color-order lookup, not a text-parsing rule, so it is
+        -- deliberately left flagged rather than guessed at.
+        WHEN value_shape = 'qualitative' AND range_shape = 'qualitative' THEN
+            CASE WHEN FIND_IN_SET(value_qual_canon, REGEXP_REPLACE(range_qual_canon, '\\s*[,-]\\s*', ',')) > 0
+                 THEN 'NORMAL' ELSE 'ABNORMAL' END
         WHEN value_shape = 'qualitative' THEN result_range
 
-        -- 5. Anything left (value has digits but doesn't parse cleanly,
-        --    e.g. a range reported as the value itself, "0-2") is flagged
-        --    rather than silently guessed at.
+        -- 5. Anything left (value has digits but doesn't parse cleanly)
+        --    is flagged rather than silently guessed at.
         ELSE 'INVALID_RESULT_VALUE'
     END AS normal_flag_std
 FROM value_classified;
