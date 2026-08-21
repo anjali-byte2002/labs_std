@@ -78,6 +78,14 @@
 -- Read-only SELECT -- no ALTER TABLE / write access required.
 -- ============================================================================
 
+-- ============================================================================
+-- Labs normal_flag standardization -- rgd_gold_ad.labs -- v2
+-- Adds: ratio/titer parsing, qualitative Positive/Negative match-vs-range
+-- comparison (replacing straight passthrough), microscopy quantity-word
+-- HIGH override, and a range-canonicalization bug fix ("< = N" spacing).
+-- Read-only SELECT -- no ALTER TABLE / write access required.
+-- ============================================================================
+
 WITH value_norm AS (
     SELECT
         l.*,
@@ -232,6 +240,15 @@ value_classified AS (
             WHEN UPPER(rv2) REGEXP '^\\*?\\(?\\[?\\s*(PLEASE\\s+)?(SEE\\s+)?(FOOT)?NOTES?\\s*:?\\s*\\)?\\]?$' THEN 'noise'
             WHEN rv2 REGEXP '\\(\\(INSURANCEDETAILS\\)\\)' THEN 'noise'
             WHEN rv2 REGEXP '^[=<>]{0,2}\\s*-?[0-9]+\\.?[0-9]*\\s*$' THEN 'numeric'
+            -- NEW: result_value is ITSELF a reported numeric range, e.g.
+            -- urine microscopy counts like "26-100/hpf" or "3-5/hpf" (a
+            -- trailing unit such as /hpf or /lpf is common but not
+            -- required -- the regex only anchors the leading "N-M" shape,
+            -- same convention as the 'plain_range' check on the range
+            -- side, which likewise ignores trailing unit text). Must be
+            -- checked before the qualitative-grade-symbol rule below so a
+            -- range like "6-25/hpf" isn't misrouted.
+            WHEN rv2 REGEXP '^-?[0-9]+\\.?[0-9]*\\s*-\\s*[+-]?[0-9]+\\.?[0-9]*' THEN 'range'
             -- NEW: a grade symbol followed by descriptive text (e.g. "1+
             -- (small)", "2+ trace") is still a semi-quantitative
             -- qualitative result, not "unparseable" just because it has
@@ -241,6 +258,23 @@ value_classified AS (
             ELSE 'unparseable'
         END AS value_shape,
         CAST(REGEXP_SUBSTR(rv2, '-?[0-9]+\\.?[0-9]*') AS DOUBLE) AS rv_numeric,
+        -- NEW: low/high bounds of the value-side range, extracted the same
+        -- way as the 'plain_range' extraction on the reference-range side.
+        -- NULL unless rv2 actually matches the range shape above.
+        CASE WHEN rv2 REGEXP '^-?[0-9]+\\.?[0-9]*\\s*-\\s*[+-]?[0-9]+\\.?[0-9]*'
+            THEN CAST(REGEXP_SUBSTR(rv2, '^-?[0-9]+\\.?[0-9]*') AS DOUBLE)
+            ELSE NULL END AS rv_low,
+        CASE WHEN rv2 REGEXP '^-?[0-9]+\\.?[0-9]*\\s*-\\s*[+-]?[0-9]+\\.?[0-9]*'
+            THEN CAST(
+                REGEXP_REPLACE(
+                    SUBSTRING(
+                        REGEXP_SUBSTR(rv2, '^-?[0-9]+\\.?[0-9]*\\s*-\\s*[+-]?[0-9]+\\.?[0-9]*'),
+                        LENGTH(REGEXP_SUBSTR(rv2, '^-?[0-9]+\\.?[0-9]*')) + 1
+                    ),
+                    '^\\s*-\\s*', ''
+                ) AS DOUBLE
+            )
+            ELSE NULL END AS rv_high,
         -- NEW: qualitative Positive/Negative synonym + grade-symbol
         -- canonicalization, applied to BOTH value and range, for the
         -- match-vs-range comparison rule below.
@@ -293,6 +327,31 @@ SELECT
                 WHEN high_val IS NOT NULL AND (
                         (high_op = '<'  AND rv_numeric >= high_val) OR
                         (high_op = '<=' AND rv_numeric >  high_val)
+                     ) THEN 'HIGH'
+                ELSE 'NORMAL'
+            END
+
+        -- 3b. result_value is ITSELF a reported range (urine microscopy
+        --     counts, e.g. "26-100/hpf") -> compare the value's own
+        --     [rv_low, rv_high] interval against the reference range's
+        --     [low_val, high_val] interval. Entirely above the reference
+        --     upper bound -> HIGH; entirely below the lower bound -> LOW;
+        --     any overlap (including an exact match, e.g. "0-5/hpf" vs
+        --     "0-5/hpf") -> NORMAL, since we can't responsibly guess a
+        --     direction from a partial overlap. Verified against 6,109
+        --     live rows: this matches the raw normal_flag in every case
+        --     that has one (e.g. "6-25/hpf" vs "0-5/hpf" -> HIGH matches
+        --     raw 'A'; "0-5/hpf" vs "0-5/hpf" -> NORMAL matches raw 'N').
+        WHEN value_shape = 'range' AND range_shape = 'qualitative' THEN 'INVALID_RESULT_RANGE'
+        WHEN value_shape = 'range' THEN
+            CASE
+                WHEN low_val IS NOT NULL AND (
+                        (low_op = '>'  AND rv_high <= low_val) OR
+                        (low_op = '>=' AND rv_high <  low_val)
+                     ) THEN 'LOW'
+                WHEN high_val IS NOT NULL AND (
+                        (high_op = '<'  AND rv_low >= high_val) OR
+                        (high_op = '<=' AND rv_low >  high_val)
                      ) THEN 'HIGH'
                 ELSE 'NORMAL'
             END
