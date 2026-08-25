@@ -1,47 +1,35 @@
 -- ============================================================================
--- normal_flag_std - StarRocks, v3
+-- normal_flag_std - MySQL port of the StarRocks v3 query
 -- ============================================================================
--- Changes from v2, addressing this round's feedback:
 --
---  1/2. Parenthesized ranges "(<3)", "(0-190)", "(<47.0)" were landing in
---       INVALID_RESULT_RANGE. Root cause: the old paren-strip regex
---       '^\((.*)\)$' requires the ')' to be the literal last character -
---       any trailing whitespace in the source data silently breaks it,
---       and nothing downstream ever strips it. Replaced with plain
---       LEFT()/RIGHT()/SUBSTRING() logic, which can't have that failure
---       mode (this also generically fixes any bracketed range, not just
---       the specific examples given).
+--  1. Backreference syntax: CORRECTED after testing. MySQL's regex
+--     engine (ICU-based) actually uses the SAME $1, $2 syntax as
+--     StarRocks for backreferences in REGEXP_REPLACE - confirmed by
+--     testing REGEXP_REPLACE(...,'\\1') and getting back a bare "1"
+--     (MySQL's own string-literal unescaping strips the backslash as
+--     an escape character before the regex engine ever sees it, so \1
+--     is not a backreference here - it's just the literal digit with
+--     a consumed backslash). All replacements below use $1/$2.
 --
---  3/4/5/7. "4.3 OR LESS", "1:20 < 1:20", "< OR = 1.07", "> OR = 60" -
---       by my own reading of the v2 logic these should already have
---       converted correctly, and I could not find the specific bug by
---       re-reading the file. Rather than keep guessing, I've (a)
---       defensively switched every \s whitespace-match to the POSIX
---       [[:space:]] class throughout, in case \s wasn't behaving as
---       expected, and (b) exposed range_shape/value_shape as output
---       columns below so if this is STILL wrong, you can tell me exactly
---       which bucket the row is landing in instead of just the final
---       flag - that's a debuggable fact instead of another guess.
+--  2. No REGEXP_EXTRACT in MySQL: StarRocks' REGEXP_EXTRACT(str, pattern,
+--     pos) lets you pull a specific numbered capture group. MySQL only
+--     has REGEXP_SUBSTR(str, pattern), which returns the whole match.
+--     - Every REGEXP_EXTRACT(..., 0) (pos=0 = "whole match") converts
+--       directly to REGEXP_SUBSTR(...) with no other change.
+--     - The two places that needed a SPECIFIC group (range_word1 = group
+--       1, range_word2 = group 2, used for the ordinal quantity-band
+--       comparison) are rewritten as a guarded REGEXP_REPLACE that
+--       matches the whole string and replaces it with just that group's
+--       backreference - guarded by a separate REGEXP check first, since
+--       REGEXP_REPLACE returns the ORIGINAL string unchanged (not NULL)
+--       when the pattern doesn't match, which would otherwise leak
+--       garbage into the ordinal lookup.
 --
---  6. "<1:40 TITER" as both value and range -> now NORMAL. The ratio
---     extraction strips the value's own "<" operator (a real, separate
---     gap), so instead of trying to fix that extraction generally, added
---     a direct check: if the (trimmed, uppercased) value text is
---     IDENTICAL to the (trimmed, uppercased) raw range text, it's NORMAL
---     outright - checked after the noise/blank filters so junk-vs-junk
---     doesn't accidentally qualify.
+--  3. Version requirements: CAST(... AS DOUBLE) needs MySQL 8.0.17+.
+--     REGEXP/REGEXP_REPLACE/REGEXP_SUBSTR (ICU-based) need MySQL 8.0.4+.
+--     Run SELECT VERSION(); first if unsure.
 --
---  8. "RBC CSF|0 CELLS/UL" vs "0-10" -> was INVALID_RESULT_VALUE. Real
---     bug: the numeric check required the number to be the ENTIRE
---     remaining string (end-anchored), so any trailing unit text after
---     the number failed it. Fixed by (a) checking the dash-range shape
---     BEFORE the numeric shape, so genuine ranges still win, and (b)
---     dropping the end-anchor from the numeric check so trailing text
---     is tolerated once a dash-range has already been ruled out.
 --
---  9. "1,001" vs "0-100" -> was INVALID_RESULT_VALUE. The thousands-
---     comma strip on the value side was only applied once; doubled it
---     to match the range side's handling, for multi-comma values.
 -- ============================================================================
 
 WITH value_norm AS (
@@ -51,7 +39,7 @@ WITH value_norm AS (
             REGEXP_REPLACE(
                 CASE
                     WHEN result_value REGEXP '<root>.*</root>'
-                        THEN REGEXP_REPLACE(result_value, '^.*<root>(.*)</root>.*$', '$1')
+                        THEN REGEXP_REPLACE(REGEXP_REPLACE(result_value, '^.*<root>', ''), '</root>.*$', '')
                     ELSE result_value
                 END,
                 '([0-9]),([0-9]{3})\\b', '$1$2'),
@@ -68,9 +56,6 @@ range_trim0 AS (
 range_unparen AS (
     SELECT
         *,
-        -- #1/#2 fix: strip a matching outer paren pair using plain
-        -- string functions instead of a regex anchor, which can't be
-        -- silently defeated by trailing whitespace inside the field
         CASE
             WHEN LEFT(rr_t0, 1) = '(' AND RIGHT(rr_t0, 1) = ')'
                 THEN SUBSTRING(rr_t0, 2, LENGTH(rr_t0) - 2)
@@ -138,8 +123,6 @@ range_eq AS (
 range_loneparen AS (
     SELECT
         *,
-        -- fallback for truncated ranges with an unmatched leading "(" -
-        -- the LEFT/RIGHT strip above only fires when both parens exist
         REGEXP_REPLACE(rr_f, '^\\(', '') AS rr_canon0
     FROM range_eq
 ),
@@ -166,8 +149,6 @@ shape_classified AS (
         *,
         TRIM(rv_unwrapped) AS rv,
         REGEXP_REPLACE(UPPER(TRIM(rv_unwrapped)), '^[A-Za-z0-9 _\\-\\.]+\\|', '') AS rv_stripped,
-        -- #6 fix: value text identical to raw range text (case/whitespace
-        -- insensitive) -> treated as NORMAL later, regardless of parsing
         UPPER(TRIM(rv_unwrapped)) = UPPER(TRIM(result_range)) AS is_value_equals_range,
         CASE
             WHEN UPPER(TRIM(rv_unwrapped)) REGEXP '^(NEG\\w*|NON[[:space:]]*-?[[:space:]]*REA\\w*)' THEN 'NEGATIVE'
@@ -199,7 +180,7 @@ shape_classified AS (
 bounds_extracted AS (
     SELECT
         *,
-        REGEXP_EXTRACT(rr_canon, '[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+', 0) AS list_bound_tok
+        REGEXP_SUBSTR(rr_canon, '[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+') AS list_bound_tok
     FROM shape_classified
 ),
 
@@ -208,71 +189,71 @@ bounds_extracted2 AS (
         *,
         CASE range_shape
             WHEN 'single_bound' THEN
-                CASE WHEN REGEXP_EXTRACT(rr_canon, '^[<>]=?', 0) IN ('>', '>=')
-                     THEN CAST(REGEXP_EXTRACT(REGEXP_EXTRACT(rr_canon, '^[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+', 0), '-?[0-9]*\\.?[0-9]+$', 0) AS DOUBLE)
+                CASE WHEN REGEXP_SUBSTR(rr_canon, '^[<>]=?') IN ('>', '>=')
+                     THEN CAST(REGEXP_SUBSTR(REGEXP_SUBSTR(rr_canon, '^[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+'), '-?[0-9]*\\.?[0-9]+$') AS DOUBLE)
                      ELSE NULL END
             WHEN 'plain_range' THEN
-                CAST(REGEXP_EXTRACT(rr_canon, '^-?[0-9]*\\.?[0-9]+', 0) AS DOUBLE)
+                CAST(REGEXP_SUBSTR(rr_canon, '^-?[0-9]*\\.?[0-9]+') AS DOUBLE)
             WHEN 'point' THEN
-                CAST(REGEXP_EXTRACT(rr_canon, '^[0-9]*\\.?[0-9]+', 0) AS DOUBLE)
+                CAST(REGEXP_SUBSTR(rr_canon, '^[0-9]*\\.?[0-9]+') AS DOUBLE)
             WHEN 'combined' THEN
-                CAST(REGEXP_EXTRACT(REGEXP_EXTRACT(rr_canon, '^[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+', 0), '-?[0-9]*\\.?[0-9]+$', 0) AS DOUBLE)
+                CAST(REGEXP_SUBSTR(REGEXP_SUBSTR(rr_canon, '^[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+'), '-?[0-9]*\\.?[0-9]+$') AS DOUBLE)
             WHEN 'list_bound' THEN
-                CASE WHEN REGEXP_EXTRACT(list_bound_tok, '^[<>]=?', 0) IN ('>', '>=')
-                     THEN CAST(REGEXP_EXTRACT(list_bound_tok, '-?[0-9]*\\.?[0-9]+$', 0) AS DOUBLE)
+                CASE WHEN REGEXP_SUBSTR(list_bound_tok, '^[<>]=?') IN ('>', '>=')
+                     THEN CAST(REGEXP_SUBSTR(list_bound_tok, '-?[0-9]*\\.?[0-9]+$') AS DOUBLE)
                      ELSE NULL END
             ELSE NULL
         END AS low_val,
         CASE range_shape
             WHEN 'single_bound' THEN
-                CASE WHEN REGEXP_EXTRACT(rr_canon, '^[<>]=?', 0) IN ('>', '>=')
-                     THEN REGEXP_EXTRACT(rr_canon, '^[<>]=?', 0)
+                CASE WHEN REGEXP_SUBSTR(rr_canon, '^[<>]=?') IN ('>', '>=')
+                     THEN REGEXP_SUBSTR(rr_canon, '^[<>]=?')
                      ELSE NULL END
             WHEN 'plain_range' THEN '>='
             WHEN 'point' THEN '>='
-            WHEN 'combined' THEN REGEXP_EXTRACT(REGEXP_EXTRACT(rr_canon, '^[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+', 0), '^[<>]=?', 0)
+            WHEN 'combined' THEN REGEXP_SUBSTR(REGEXP_SUBSTR(rr_canon, '^[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+'), '^[<>]=?')
             WHEN 'list_bound' THEN
-                CASE WHEN REGEXP_EXTRACT(list_bound_tok, '^[<>]=?', 0) IN ('>', '>=')
-                     THEN REGEXP_EXTRACT(list_bound_tok, '^[<>]=?', 0)
+                CASE WHEN REGEXP_SUBSTR(list_bound_tok, '^[<>]=?') IN ('>', '>=')
+                     THEN REGEXP_SUBSTR(list_bound_tok, '^[<>]=?')
                      ELSE NULL END
             ELSE NULL
         END AS low_op,
         CASE range_shape
             WHEN 'single_bound' THEN
-                CASE WHEN REGEXP_EXTRACT(rr_canon, '^[<>]=?', 0) IN ('<', '<=')
-                     THEN CAST(REGEXP_EXTRACT(REGEXP_EXTRACT(rr_canon, '^[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+', 0), '-?[0-9]*\\.?[0-9]+$', 0) AS DOUBLE)
+                CASE WHEN REGEXP_SUBSTR(rr_canon, '^[<>]=?') IN ('<', '<=')
+                     THEN CAST(REGEXP_SUBSTR(REGEXP_SUBSTR(rr_canon, '^[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+'), '-?[0-9]*\\.?[0-9]+$') AS DOUBLE)
                      ELSE NULL END
             WHEN 'plain_range' THEN
                 CAST(
                     REGEXP_REPLACE(
                         SUBSTRING(
-                            REGEXP_EXTRACT(rr_canon, '^-?[0-9]*\\.?[0-9]+[[:space:]]*-[[:space:]]*[+-]?[0-9]*\\.?[0-9]+', 0),
-                            LENGTH(REGEXP_EXTRACT(rr_canon, '^-?[0-9]*\\.?[0-9]+', 0)) + 1
+                            REGEXP_SUBSTR(rr_canon, '^-?[0-9]*\\.?[0-9]+[[:space:]]*-[[:space:]]*[+-]?[0-9]*\\.?[0-9]+'),
+                            LENGTH(REGEXP_SUBSTR(rr_canon, '^-?[0-9]*\\.?[0-9]+')) + 1
                         ),
                         '^[[:space:]]*-[[:space:]]*', ''
                     ) AS DOUBLE
                 )
             WHEN 'point' THEN
-                CAST(REGEXP_EXTRACT(rr_canon, '^[0-9]*\\.?[0-9]+', 0) AS DOUBLE)
+                CAST(REGEXP_SUBSTR(rr_canon, '^[0-9]*\\.?[0-9]+') AS DOUBLE)
             WHEN 'combined' THEN
-                CAST(REGEXP_EXTRACT(REGEXP_EXTRACT(rr_canon, '[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+$', 0), '-?[0-9]*\\.?[0-9]+$', 0) AS DOUBLE)
+                CAST(REGEXP_SUBSTR(REGEXP_SUBSTR(rr_canon, '[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+$'), '-?[0-9]*\\.?[0-9]+$') AS DOUBLE)
             WHEN 'list_bound' THEN
-                CASE WHEN REGEXP_EXTRACT(list_bound_tok, '^[<>]=?', 0) IN ('<', '<=')
-                     THEN CAST(REGEXP_EXTRACT(list_bound_tok, '-?[0-9]*\\.?[0-9]+$', 0) AS DOUBLE)
+                CASE WHEN REGEXP_SUBSTR(list_bound_tok, '^[<>]=?') IN ('<', '<=')
+                     THEN CAST(REGEXP_SUBSTR(list_bound_tok, '-?[0-9]*\\.?[0-9]+$') AS DOUBLE)
                      ELSE NULL END
             ELSE NULL
         END AS high_val,
         CASE range_shape
             WHEN 'single_bound' THEN
-                CASE WHEN REGEXP_EXTRACT(rr_canon, '^[<>]=?', 0) IN ('<', '<=')
-                     THEN REGEXP_EXTRACT(rr_canon, '^[<>]=?', 0)
+                CASE WHEN REGEXP_SUBSTR(rr_canon, '^[<>]=?') IN ('<', '<=')
+                     THEN REGEXP_SUBSTR(rr_canon, '^[<>]=?')
                      ELSE NULL END
             WHEN 'plain_range' THEN '<='
             WHEN 'point' THEN '<='
-            WHEN 'combined' THEN REGEXP_EXTRACT(REGEXP_EXTRACT(rr_canon, '[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+$', 0), '^[<>]=?', 0)
+            WHEN 'combined' THEN REGEXP_SUBSTR(REGEXP_SUBSTR(rr_canon, '[<>]=?[[:space:]]*-?[0-9]*\\.?[0-9]+$'), '^[<>]=?')
             WHEN 'list_bound' THEN
-                CASE WHEN REGEXP_EXTRACT(list_bound_tok, '^[<>]=?', 0) IN ('<', '<=')
-                     THEN REGEXP_EXTRACT(list_bound_tok, '^[<>]=?', 0)
+                CASE WHEN REGEXP_SUBSTR(list_bound_tok, '^[<>]=?') IN ('<', '<=')
+                     THEN REGEXP_SUBSTR(list_bound_tok, '^[<>]=?')
                      ELSE NULL END
             ELSE NULL
         END AS high_op
@@ -296,8 +277,16 @@ value_classified AS (
             WHEN rv_stripped = 'PACKED' THEN 7
             ELSE NULL
         END AS value_mval_ordinal,
-        REGEXP_EXTRACT(rr_canon, '^([A-Z]+)[[:space:]]*-[[:space:]]*([A-Z]+)', 1) AS range_word1,
-        REGEXP_EXTRACT(rr_canon, '^([A-Z]+)[[:space:]]*-[[:space:]]*([A-Z]+)', 2) AS range_word2,
+        -- MySQL has no REGEXP_EXTRACT(str,pattern,group) - isolate group 1
+        -- via REGEXP_REPLACE across the whole matched string, guarded by
+        -- a REGEXP check first (REGEXP_REPLACE returns the ORIGINAL
+        -- string unchanged, not NULL, when nothing matches)
+        CASE WHEN rr_canon REGEXP '^([A-Z]+)[[:space:]]*-[[:space:]]*([A-Z]+)'
+             THEN REGEXP_REPLACE(rr_canon, '^([A-Z]+)[[:space:]]*-[[:space:]]*([A-Z]+).*$', '$1')
+             ELSE NULL END AS range_word1,
+        CASE WHEN rr_canon REGEXP '^([A-Z]+)[[:space:]]*-[[:space:]]*([A-Z]+)'
+             THEN REGEXP_REPLACE(rr_canon, '^([A-Z]+)[[:space:]]*-[[:space:]]*([A-Z]+).*$', '$2')
+             ELSE NULL END AS range_word2,
         CASE
             WHEN rv2 IS NULL OR rv2 = '' THEN 'blank'
             WHEN UPPER(rv2) REGEXP '^#[[:space:]]*[0-9]+$' THEN 'noise'
@@ -311,16 +300,16 @@ value_classified AS (
             WHEN rv2 NOT REGEXP '[0-9]' THEN 'qualitative'
             ELSE 'unparseable'
         END AS value_shape,
-        CAST(REGEXP_EXTRACT(rv2, '-?[0-9]*\\.?[0-9]+', 0) AS DOUBLE) AS rv_numeric,
+        CAST(REGEXP_SUBSTR(rv2, '-?[0-9]*\\.?[0-9]+') AS DOUBLE) AS rv_numeric,
         CASE WHEN rv2 REGEXP '^-?[0-9]*\\.?[0-9]+[[:space:]]*-[[:space:]]*[+-]?[0-9]*\\.?[0-9]+'
-            THEN CAST(REGEXP_EXTRACT(rv2, '^-?[0-9]*\\.?[0-9]+', 0) AS DOUBLE)
+            THEN CAST(REGEXP_SUBSTR(rv2, '^-?[0-9]*\\.?[0-9]+') AS DOUBLE)
             ELSE NULL END AS rv_low,
         CASE WHEN rv2 REGEXP '^-?[0-9]*\\.?[0-9]+[[:space:]]*-[[:space:]]*[+-]?[0-9]*\\.?[0-9]+'
             THEN CAST(
                 REGEXP_REPLACE(
                     SUBSTRING(
-                        REGEXP_EXTRACT(rv2, '^-?[0-9]*\\.?[0-9]+[[:space:]]*-[[:space:]]*[+-]?[0-9]*\\.?[0-9]+', 0),
-                        LENGTH(REGEXP_EXTRACT(rv2, '^-?[0-9]*\\.?[0-9]+', 0)) + 1
+                        REGEXP_SUBSTR(rv2, '^-?[0-9]*\\.?[0-9]+[[:space:]]*-[[:space:]]*[+-]?[0-9]*\\.?[0-9]+'),
+                        LENGTH(REGEXP_SUBSTR(rv2, '^-?[0-9]*\\.?[0-9]+')) + 1
                     ),
                     '^[[:space:]]*-[[:space:]]*', ''
                 ) AS DOUBLE
